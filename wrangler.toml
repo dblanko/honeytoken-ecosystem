@@ -1,0 +1,27 @@
+name = "honeytoken-canary"
+main = "cloudflare_worker.js"
+compatibility_date = "2024-01-01"
+
+# If you're pointing this at your own domain instead of workers.dev,
+# add routes here. Important: this block has to come BEFORE
+# [[kv_namespaces]] below -- TOML treats anything after a [[table]]
+# header as belonging to that table until the next header shows up,
+# so routes placed after kv_namespaces silently gets swallowed into
+# it and wrangler just ignores it. Ask me how I know.
+#
+# routes = [
+#   { pattern = "canary.yourdomain.com/*", zone_name = "yourdomain.com" }
+# ]
+#
+# Simpler alternative: skip routes entirely and add a Custom Domain
+# from the Cloudflare dashboard (Workers & Pages -> your worker ->
+# Settings -> Domains & Routes -> Add -> Custom Domain). It creates
+# the DNS record for you, which routes does not.
+
+# Create the namespace with:
+#   wrangler kv namespace create HONEYTOKEN_KV
+# then paste the id (and preview_id, for wrangler dev) below.
+[[kv_namespaces]]
+binding = "HONEYTOKEN_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"

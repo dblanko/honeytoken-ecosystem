@@ -1,0 +1,4 @@
+click>=8.1
+
+# fake_postgres_listener.py and cloudflare_worker.js only use the
+# Python stdlib / built-in Cloudflare Workers APIs -- no other deps.

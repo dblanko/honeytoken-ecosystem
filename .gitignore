@@ -1,0 +1,43 @@
+# --- Secrets / decoys generated at runtime ---
+decoys/
+.env
+!.env.example
+
+# --- Terraform ---
+# .terraform/ is a local provider cache, large and machine-specific.
+# terraform.tfstate contains real values of "sensitive" outputs
+# (including the AWS secret access key) in PLAINTEXT -- never commit it.
+**/.terraform/
+**/.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfstate.backup
+*.tfvars
+crash.log
+crash.*.log
+
+# --- Node / wrangler ---
+node_modules/
+.wrangler/
+npm-debug.log*
+yarn-error.log*
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# --- Logs from local testing ---
+*.log
