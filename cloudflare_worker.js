@@ -28,6 +28,10 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    if (path.startsWith("/azure-hit/")) {
+      return handleAzureEventGrid(request, env, ctx, path);
+    }
+
     const isHit = path.startsWith("/hit/") || path.startsWith("/slack/");
     if (!isHit) {
       return new Response("Not Found", { status: 404 });
@@ -153,5 +157,116 @@ async function sendTelegramAlert(env, text) {
       text,
       parse_mode: "Markdown",
     }),
+  });
+}
+
+/**
+ * Azure Event Grid handler.
+ *
+ * Two things make this different from the plain /hit/ path:
+ *
+ * 1. Event Grid requires a validation handshake before it'll deliver
+ *    any real events to a webhook. When you create the event
+ *    subscription, Azure POSTs a single-element array containing a
+ *    "Microsoft.EventGrid.SubscriptionValidationEvent" with a
+ *    validationCode. You have to echo that code back synchronously
+ *    as { validationResponse: <code> }, or the subscription creation
+ *    just fails outright. This isn't optional and there's no way to
+ *    skip it for a plain webhook endpoint.
+ *
+ * 2. Real events arrive as an ARRAY of events (Event Grid schema),
+ *    not a single object like the AWS API Destination payload. Each
+ *    element has an eventType, a subject, and a data blob shaped like
+ *    an Azure Activity Log entry (caller, claims, resourceId, status,
+ *    etc). We only forward the fields that matter for the alert.
+ *
+ * NOTE: this path hasn't been through the same live end-to-end test
+ * the AWS path got (no Azure account was available while building
+ * this). The validation handshake logic follows Microsoft's
+ * documented contract closely, but if you're the first person to
+ * actually run `terraform apply` against azure/, budget time to
+ * verify this the same way the AWS module got verified -- and please
+ * report back what needed fixing.
+ */
+async function handleAzureEventGrid(request, env, ctx, path) {
+  const canaryId = path.split("/")[2] || "unknown";
+
+  let events;
+  try {
+    events = await request.json();
+  } catch (e) {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  if (!Array.isArray(events)) {
+    events = [events];
+  }
+
+  // Validation handshake: respond synchronously, don't alert on this.
+  const validationEvent = events.find(
+    (e) => e.eventType === "Microsoft.EventGrid.SubscriptionValidationEvent"
+  );
+  if (validationEvent) {
+    const validationCode = validationEvent.data?.validationCode;
+    return new Response(JSON.stringify({ validationResponse: validationCode }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const now = new Date().toISOString();
+
+  for (const event of events) {
+    // Event Grid's own system/control-plane notifications (subscription created,
+    // updated, deleted, etc.) come through this same webhook and look just like
+    // a real event -- confirmed in testing when deleting a Storage Account
+    // cascaded into an Event Grid subscription teardown, which fired a
+    // SubscriptionDeletedEvent straight into this handler and generated a
+    // bogus alert. None of these carry actual Activity Log data (appid,
+    // caller, etc. all come back "unknown"), so skip anything in this family
+    // rather than trying to keep an exhaustive list of every lifecycle event
+    // name Microsoft might send.
+    if (event.eventType && event.eventType.startsWith("Microsoft.EventGrid.")) {
+      continue;
+    }
+
+    const data = event.data || {};
+    const appId = data.claims?.appid || data.claims?.appId || "unknown";
+    const caller = data.caller || "unknown";
+    const eventName = data.eventName?.value || data.eventName || event.eventType || "unknown";
+    const status = data.status?.value || data.status || "unknown";
+    const resourceId = data.resourceId || "unknown";
+
+    const dedupKey = `dedup-azure:${canaryId}:${appId}`;
+    const decision = await checkAndUpdateDedup(env, dedupKey);
+
+    if (decision.shouldAlert) {
+      const message =
+        `🚨 *AZURE HONEYTOKEN TRIGGERED*\n\n` +
+        `*Canary ID:* \`${canaryId}\`\n` +
+        `*App (client) ID used:* \`${appId}\`\n` +
+        `*Caller:* \`${caller}\`\n` +
+        `*API call:* ${eventName}\n` +
+        `*Status:* ${status}\n` +
+        `*Resource:* \`${resourceId}\`\n` +
+        `*Delivered from IP:* \`${ip}\` (this is Azure's own IP, not necessarily the attacker's -- Activity Log entries sometimes include a caller IP in \`data.httpRequest.clientIpAddress\`, but this wasn't verified end-to-end; check the raw event data if you need the real source IP)\n` +
+        `*Time (UTC):* ${now}\n` +
+        `_Further hits from this app ID in the next ${Math.round(DEDUP_WINDOW_SECONDS / 60)} min will be aggregated._`;
+      ctx.waitUntil(sendTelegramAlert(env, message));
+    } else if (decision.shouldSendDigest) {
+      const digest =
+        `🔁 *Repeated Azure hits*\n\n` +
+        `*Canary ID:* \`${canaryId}\`\n` +
+        `*App (client) ID:* \`${appId}\`\n` +
+        `This app ID made *${decision.previousCount}* more call(s) in the last ${Math.round(DEDUP_WINDOW_SECONDS / 60)} min.\n` +
+        `*Time (UTC):* ${now}`;
+      ctx.waitUntil(sendTelegramAlert(env, digest));
+    }
+  }
+
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
   });
 }

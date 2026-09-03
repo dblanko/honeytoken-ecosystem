@@ -104,9 +104,27 @@ def make_db_connection_string(label: str, canary_domain: str) -> dict:
     }
 
 
+def make_azure_credentials(label: str, canary_domain: str) -> dict:
+    canary_id = new_id()
+    client_id = str(uuid.uuid4())
+    tenant_id = str(uuid.uuid4())
+    client_secret = rand_str(40, string.ascii_letters + string.digits + "._~")
+    return {
+        "type": "azure",
+        "label": label,
+        "canary_id": canary_id,
+        "azure_client_id": client_id,
+        "azure_tenant_id": tenant_id,
+        "azure_client_secret": client_secret,
+        "internal_api_endpoint": f"https://{canary_domain}/azure-hit/{canary_id}",
+        "note": "For a real trigger, deploy the azure/ Terraform module (App Registration + Event Grid on Activity Log). Path is /azure-hit/, not /hit/ -- the Worker needs the Azure-specific handler for the Event Grid validation handshake.",
+    }
+
+
 def build_all(canary_domain: str) -> list:
     return [
         make_aws_key("prod-backup-script", canary_domain),
+        make_azure_credentials("legacy-billing-service", canary_domain),
         make_github_token("ci-deploy-readonly", canary_domain),
         make_slack_webhook("alerts-finance-channel", canary_domain),
         make_db_connection_string("legacy-reporting-db", canary_domain),
@@ -153,17 +171,28 @@ def generate(output, canary_domain, gitignore):
         f.write(f"aws_secret_access_key = {by_type['aws']['aws_secret_access_key']}\n")
     generated_files.append(aws_path)
 
+    azure_path = os.path.join(output, ".azure_credentials")
+    with open(azure_path, "w") as f:
+        f.write("# az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID\n")
+        f.write(f"AZURE_CLIENT_ID={by_type['azure']['azure_client_id']}\n")
+        f.write(f"AZURE_CLIENT_SECRET={by_type['azure']['azure_client_secret']}\n")
+        f.write(f"AZURE_TENANT_ID={by_type['azure']['azure_tenant_id']}\n")
+    generated_files.append(azure_path)
+
     env_path = os.path.join(output, ".env")
     with open(env_path, "w") as f:
         f.write(f"GITHUB_TOKEN={by_type['github']['github_token']}\n")
         f.write(f"SLACK_WEBHOOK_URL={by_type['slack_webhook']['slack_webhook_url']}\n")
         f.write(f"DATABASE_URL={by_type['postgres_dsn']['connection_string']}\n")
+        f.write(f"AZURE_CLIENT_ID={by_type['azure']['azure_client_id']}\n")
+        f.write(f"AZURE_CLIENT_SECRET={by_type['azure']['azure_client_secret']}\n")
+        f.write(f"AZURE_TENANT_ID={by_type['azure']['azure_tenant_id']}\n")
     generated_files.append(env_path)
 
     env_example_path = os.path.join(output, ".env.example")
     with open(env_example_path, "w") as f:
         f.write("# Example for CI secrets -- fill in the real values from .env\n")
-        f.write("GITHUB_TOKEN=\nSLACK_WEBHOOK_URL=\nDATABASE_URL=\n")
+        f.write("GITHUB_TOKEN=\nSLACK_WEBHOOK_URL=\nDATABASE_URL=\nAZURE_CLIENT_ID=\nAZURE_CLIENT_SECRET=\nAZURE_TENANT_ID=\n")
     generated_files.append(env_example_path)
 
     config_path = os.path.join(output, "config.json")
@@ -172,6 +201,11 @@ def generate(output, canary_domain, gitignore):
             "aws": {
                 "access_key_id": by_type["aws"]["aws_access_key_id"],
                 "secret_access_key": by_type["aws"]["aws_secret_access_key"],
+            },
+            "azure": {
+                "client_id": by_type["azure"]["azure_client_id"],
+                "client_secret": by_type["azure"]["azure_client_secret"],
+                "tenant_id": by_type["azure"]["azure_tenant_id"],
             },
             "slack_webhook": by_type["slack_webhook"]["slack_webhook_url"],
         }, f, indent=2)
@@ -184,7 +218,8 @@ def generate(output, canary_domain, gitignore):
 
     click.echo("\ncanary_id summary for tracking:")
     for t in tokens:
-        click.echo(f"  [{t['type']:14}] {t['label']:24} id={t['canary_id']}")
+        note = "  (experimental — see README, Activity Log detection currently doesn't work)" if t["type"] == "azure" else ""
+        click.echo(f"  [{t['type']:14}] {t['label']:24} id={t['canary_id']}{note}")
 
 
 def _append_to_gitignore(output_dir, paths):
@@ -229,7 +264,7 @@ def clean(vault, yes):
     output_dir = os.path.dirname(vault) or "."
     candidates = [
         os.path.join(output_dir, name)
-        for name in (".aws_credentials", ".env", ".env.example", "config.json", VAULT_FILENAME)
+        for name in (".aws_credentials", ".azure_credentials", ".env", ".env.example", "config.json", VAULT_FILENAME)
     ]
     existing = [p for p in candidates if os.path.exists(p)]
 
@@ -272,6 +307,9 @@ def ci_env(vault, fmt):
         "DATABASE_URL": by_type["postgres_dsn"]["connection_string"],
         "AWS_ACCESS_KEY_ID": by_type["aws"]["aws_access_key_id"],
         "AWS_SECRET_ACCESS_KEY": by_type["aws"]["aws_secret_access_key"],
+        "AZURE_CLIENT_ID": by_type["azure"]["azure_client_id"],
+        "AZURE_CLIENT_SECRET": by_type["azure"]["azure_client_secret"],
+        "AZURE_TENANT_ID": by_type["azure"]["azure_tenant_id"],
     }
 
     if fmt == "dotenv":
