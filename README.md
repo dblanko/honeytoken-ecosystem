@@ -12,6 +12,7 @@ This is a defensive tool: decoys you plant in infrastructure you own or are auth
 - `tokens_vault.json` is your private map of what's fake and where it lives — it's auto-added to `.gitignore`, but double-check before every commit, especially if you're scripting this.
 - The alert screenshots in this README have had the real IP addresses and AWS account ID redacted. If you fork this and post your own screenshots, check yours too — the alert bodies include your public IP and (for the AWS path) your account ID by design, since that's the whole point of the alert.
 - The Azure module currently creates a real App Registration + Service Principal in your tenant even though detection doesn't work yet (see below) — that's still a live credential sitting in your directory, so the same "only in infrastructure you own" rule applies, and you may want to clean it up (`terraform destroy` in `azure/`) if you're not actively working on the detection gap.
+- Parts of this documentation were drafted with the help of an AI writing assistant, based on the maintainer's own hands-on testing and findings. The technical claims, error codes, and diagnostic conclusions throughout this README (the AWS and Azure sections in particular) come from direct testing by the maintainer, not from the AI tool.
 
 ## Prerequisites
 
@@ -36,6 +37,8 @@ Nothing here is expensive, but there's more setup than the Quickstart alone lets
 - **Terraform CLI + Azure CLI** -- only if you're using the Azure honeytoken
 
 If you're on Windows, note that `wrangler` and WSL occasionally fight each other over binary architecture -- see the gotchas section near the bottom before you burn an hour on it.
+
+Commands in this guide use bash syntax (line-continuation backslashes). On native Windows PowerShell without WSL, replace `\` at line-ends with a backtick `` ` ``, and use `python` instead of `python3`.
 
 **Two ways to go through this:**
 
@@ -167,10 +170,11 @@ cp .env.example .env   # fill in TELEGRAM_*
 docker compose up -d
 ```
 
-Two things that trip people up here:
+Three things that trip people up here:
 
 - The filename has to change from `.env.example` to exactly `.env` -- Docker Compose only looks for `.env`, nothing else. The `cp` command above does this automatically, but if you're copying the file by hand in a file manager instead of the terminal, renaming it is a separate step you have to remember -- just dragging a copy over won't do it.
 - `.env` won't show up in a plain `ls` afterwards -- files starting with a dot are hidden by default on Linux/macOS. That's normal, not a sign the copy failed. Use `ls -a` or `cat .env` to confirm it's there.
+- On Windows, Docker Desktop needs either the WSL2 backend or Hyper-V. Hyper-V requires Windows Pro/Enterprise/Education -- it's not available on Windows Home.
 
 ### 6. (optional) Real AWS honeytoken
 
@@ -291,3 +295,4 @@ Issues and PRs welcome — especially around the GitHub-token detection gap and 
 ## License
 
 MIT — see [LICENSE](LICENSE). Use it, fork it, ship it in your own stack; just don't point it at infrastructure you don't own or have permission to test.
+
