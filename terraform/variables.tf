@@ -10,6 +10,18 @@ variable "canary_user_name" {
   default     = "svc-backup-legacy"
 }
 
+variable "decoy_bucket_prefix" {
+  description = <<-EOT
+    Name prefix for the decoy S3 bucket (the account ID gets appended, since
+    bucket names must be globally unique). Pick something an attacker would
+    want to open -- the whole point is that it looks worth looking inside.
+    Data events are logged for this bucket, so any attempt to list or read
+    its contents triggers an alert.
+  EOT
+  type        = string
+  default     = "company-db-backups"
+}
+
 variable "worker_alert_url" {
   description = <<-EOT
     Full URL of your Cloudflare Worker's alert endpoint, e.g.

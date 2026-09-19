@@ -220,6 +220,8 @@ I built the first version of the Terraform module assuming CloudTrail's free 90-
 
 2. **EventBridge drops read-only management events by default.** `GetCallerIdentity`, `ListBuckets`, any `DescribeXxx` call -- exactly the kind of recon an attacker does first -- gets silently filtered unless the rule's `state` is set to `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS` instead of the default `ENABLED`. Both are wired into `terraform/main.tf` now.
 
+3. **Data events aren't covered by the management-events fix.** `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS` only affects management-plane calls (`ListBuckets`, `GetCallerIdentity`). Object-level S3 operations (`ListObjects`, `GetObject`, `PutObject`) are data events and aren't logged by CloudTrail at all unless the Trail has an explicit data event selector configured -- confirmed by testing all three call types (management, data-read, data-write) against a real deny-all key. The Terraform module now scopes a data event selector to just the decoy bucket, keeping logging volume (and cost) minimal.
+
 Also worth knowing before you test:
 
 - **Match your region.** `variables.tf` defaults `aws_region` to `us-east-1`. If your AWS CLI profile defaults to something else, the honeytoken IAM user and the EventBridge rule end up in different regions relative to where you're checking, and everything looks broken when it's actually just split across two places. Pass `-var="aws_region=..."` explicitly and match it to your CLI's default region.
