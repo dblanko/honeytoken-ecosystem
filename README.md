@@ -36,9 +36,9 @@ Nothing here is expensive, but there's more setup than the Quickstart alone lets
 - **Terraform CLI + AWS CLI** -- only if you're using the AWS honeytoken
 - **Terraform CLI + Azure CLI** -- only if you're using the Azure honeytoken
 
-If you're on Windows, note that `wrangler` and WSL occasionally fight each other over binary architecture -- see the gotchas section near the bottom before you burn an hour on it.
+**Credentials Terraform needs (AWS and Azure paths only):** Terraform creates the honeytoken identity *for* you, so it has to run under *your* real account first. Before `terraform apply`, authenticate as yourself -- `aws configure` (or set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_DEFAULT_REGION`) for AWS, `az login` for Azure. Without this, `terraform apply` stops with `No valid credential sources found`. These are *not* the honeytoken keys -- those are what the apply produces.
 
-Commands in this guide use bash syntax (line-continuation backslashes). On native Windows PowerShell without WSL, replace `\` at line-ends with a backtick `` ` ``, and use `python` instead of `python3`.
+**On Windows:** the commands in this guide are bash. Use them as-is on Linux, macOS or WSL. For native PowerShell, jump to [Windows (PowerShell, without WSL)](#windows-powershell-without-wsl) -- line continuation, `python` vs `python3`, `curl` and a few first-run errors all differ. (Separately, `wrangler` and WSL occasionally fight each other over binary architecture -- see the gotchas section near the bottom.)
 
 **Two ways to go through this:**
 
@@ -117,7 +117,7 @@ A leaked webhook, DB connection string, or AWS key gets used → an alert lands 
 | `cloudflare_worker.js` | Serverless catcher for HTTP-based triggers, with KV-backed dedup |
 | `fake_postgres_listener.py` | TCP listener for the DB honeytoken (runs fine in Docker) |
 | `Dockerfile`, `docker-compose.yml` | Packaging for the DB listener only -- doesn't cover the Worker, CLI, or Terraform |
-| `terraform/` | AWS: IAM user with no permissions + CloudTrail + EventBridge -> Worker, no Lambda |
+| `terraform/` | AWS: IAM user with no permissions + CloudTrail (with a data-event selector scoped to a decoy S3 bucket) + EventBridge -> Worker, no Lambda |
 | `azure/` | Azure: App Registration + Service Principal with zero roles + Event Grid on Activity Log -> Worker. Deploys cleanly but the core detection does not currently work -- see the Azure section below for what was tested and why |
 | `wrangler.toml` | Worker deploy config, including the KV namespace |
 
@@ -133,8 +133,11 @@ Talk to `@BotFather`, `/newbot`, grab the `TELEGRAM_BOT_TOKEN`. Send the bot any
 npm install -g wrangler
 wrangler login
 
+# production namespace -> paste the returned id into wrangler.toml as `id`
 wrangler kv namespace create HONEYTOKEN_KV
-# paste the returned id/preview_id into wrangler.toml
+
+# preview namespace -> paste the returned id into wrangler.toml as `preview_id`
+wrangler kv namespace create HONEYTOKEN_KV --preview
 
 wrangler secret put TELEGRAM_BOT_TOKEN
 wrangler secret put TELEGRAM_CHAT_ID
@@ -142,6 +145,16 @@ wrangler deploy
 ```
 
 You'll get a `*.workers.dev` URL. If you want your own domain instead, see the wrangler.toml comments -- and read the gotcha about routes ordering further down, it'll save you twenty minutes.
+
+Before generating any decoys, check that the Worker and Telegram are actually connected:
+
+```bash
+curl -X POST "https://<your-worker>.workers.dev/hit/test-manual-id" \
+  -H "Content-Type: application/json" \
+  -d '{"probe":"hello"}'
+```
+
+A "HONEYTOKEN TRIGGERED" message should land in Telegram within seconds. If it doesn't, fix this before going further -- nothing downstream will work either.
 
 ### 3. Generate decoys
 
@@ -153,7 +166,17 @@ python3 honeytoken_cli.py generate \
   --canary-domain your-worker-domain.workers.dev
 ```
 
-This writes `decoys/tokens_vault.json` (your private record of what's fake -- never commit it) plus the actual decoy files (`.aws_credentials`, `.env`, `config.json`), auto-added to `.gitignore`.
+This writes `decoys/tokens_vault.json` (your private record of what's fake -- never commit it) plus the actual decoy files (`.aws_credentials`, `.azure_credentials`, `.env`, `config.json`), auto-added to `.gitignore`.
+
+On recent Debian/Ubuntu releases, `pip install` into the system Python is refused (PEP 668, `externally-managed-environment`) -- create a virtualenv first: `python3 -m venv venv && source venv/bin/activate`.
+
+To check that a decoy actually fires, take `slack_webhook_url` from `decoys/tokens_vault.json` and POST to it, the way a bot that found it would:
+
+```bash
+curl -X POST "<slack_webhook_url>" -H "Content-Type: application/json" -d '{"text":"test message from attacker simulation"}'
+```
+
+The alert carries that decoy's own canary_id, so you can see the whole chain (decoy -> Worker -> Telegram) working without typing an id by hand.
 
 ### 4. Scatter them
 
@@ -178,6 +201,8 @@ Three things that trip people up here:
 
 ### 6. (optional) Real AWS honeytoken
 
+Terraform runs as *you*, not as the honeytoken -- authenticate to your own AWS account first (see Prerequisites). Use the `aws` canary_id from `decoys/tokens_vault.json` in the URL.
+
 ```bash
 cd terraform
 terraform init
@@ -186,9 +211,13 @@ terraform apply \
   -var="aws_region=eu-central-1"
 ```
 
-Creates an IAM user with zero permissions, a CloudTrail trail, and an EventBridge rule that POSTs straight to your Worker when the key gets used -- see the "AWS gotchas" section below before you run this, it'll save you a debugging afternoon.
+Creates an IAM user with an explicit deny-all policy (that user's access key is the honeytoken), a CloudTrail trail with its own log bucket, a decoy S3 bucket (`company-db-backups-<account id>`) with a data-event selector scoped to just that bucket, and an EventBridge rule that POSTs straight to your Worker when the key gets used. Read the decoy key back with `terraform output canary_access_key_id` and `terraform output -raw canary_secret_access_key`. See the "AWS gotchas" section below before you run this, it'll save you a debugging afternoon.
+
+**Keep `terraform.tfstate`.** Run `apply` from one working folder and keep the state file there -- it's the only record of what Terraform created (it's gitignored on purpose, since it holds the decoy secret in plaintext). Lose it, or run Terraform from a fresh copy of the repo, and Terraform will think nothing exists: `plan` offers to create everything again and `destroy` has nothing to destroy.
 
 ### 6.5. (optional) Real Azure honeytoken
+
+Sign in to your tenant first with `az login`, and use the `azure` canary_id from the vault.
 
 ```bash
 cd azure
@@ -205,16 +234,103 @@ Same idea as the AWS module -- an identity with zero permissions, wired to that 
 python3 honeytoken_cli.py clean --vault ./decoys/tokens_vault.json --yes
 ```
 
+That removes the local decoy files. The cloud resources are separate -- remove them with `terraform destroy`, from the same folder you ran `apply` in (it needs `terraform.tfstate`) and with the same `-var` values:
+
+```bash
+cd terraform
+terraform destroy \
+  -var="worker_alert_url=https://your-worker-domain/hit/<canary_id>" \
+  -var="aws_region=eu-central-1"
+```
+
+Same idea in `azure/`. On Azure, `destroy` can fail partway with a `404 Directory_ObjectNotFound` while removing the application password (Entra ID is eventually consistent, the same replication lag that can make `apply` sit on "Still creating..." for a few minutes). Wait a bit and run `destroy` again -- the second pass finishes the job.
+
+## Windows (PowerShell, without WSL)
+
+The Quickstart above is written in bash. On Linux, macOS or WSL use it as is. On native Windows PowerShell the same steps work, with the differences below. This section was checked on a clean Windows machine without WSL, except for the Docker-based DB honeytoken (Docker Desktop needs hardware virtualization, which wasn't available on the test machine) and the Azure module (not re-tested on Windows).
+
+**Install** (regular Windows installers, no WSL needed):
+
+- Python 3.8+ from python.org -- tick "Add python.exe to PATH". Check with `python --version` (on Windows the command is `python`, not `python3`).
+- Node.js (LTS) from nodejs.org.
+- Terraform: download the Windows AMD64 zip from HashiCorp, put `terraform.exe` in the folder you run it from and call it as `.\terraform`. `winget install HashiCorp.Terraform` works on some machines, but it can be blocked by policy.
+- AWS CLI, only if you want `aws configure` -- environment variables work too (below).
+- The project itself: "Download ZIP" on GitHub and extract it. No git needed.
+
+**Allow npm to run.** Out of the box PowerShell blocks `npm` ("running scripts is disabled on this system"). Once per user, no admin needed:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+Then `npm install -g wrangler`. If wrangler won't start afterwards because npm skipped its install scripts, retry with `npm install -g --allow-scripts=esbuild,workerd wrangler`. (This showed up on one machine and depends on your npm version and settings.)
+
+**Write commands as one-liners.** The `\` at the end of a line in the bash examples does nothing in PowerShell, so a pasted multi-line command runs line by line and fails. PowerShell's own continuation character is a backtick, and it has to be the very last character on the line -- a single trailing space breaks it. Everything below is a one-liner for that reason.
+
+**Don't use `curl` for the tests.** In PowerShell `curl` is an alias for `Invoke-WebRequest`, and quoting JSON for `curl.exe` is a mess. `Invoke-RestMethod` avoids the problem.
+
+Step 2 -- Worker (the last line is the connectivity check):
+
+```powershell
+wrangler login
+wrangler kv namespace create HONEYTOKEN_KV
+wrangler kv namespace create HONEYTOKEN_KV --preview
+wrangler secret put TELEGRAM_BOT_TOKEN
+wrangler secret put TELEGRAM_CHAT_ID
+wrangler deploy
+Invoke-RestMethod -Uri "https://<your-worker>.workers.dev/hit/test-manual-id" -Method Post -ContentType "application/json" -Body '{"probe":"hello"}'
+```
+
+Steps 3 and 4 -- decoys, a test hit, CI export:
+
+```powershell
+pip install -r requirements.txt
+python honeytoken_cli.py generate --output ./decoys --canary-domain your-worker-domain.workers.dev
+Get-ChildItem -Path ./decoys -Force
+Invoke-RestMethod -Uri "<slack_webhook_url from tokens_vault.json>" -Method Post -ContentType "application/json" -Body '{"text":"test message from attacker simulation"}'
+python honeytoken_cli.py ci-env --format github-actions
+```
+
+No virtualenv is needed on Windows -- the python.org build installs packages for your user.
+
+Step 6 -- AWS:
+
+```powershell
+$env:AWS_ACCESS_KEY_ID="<your own admin key>"
+$env:AWS_SECRET_ACCESS_KEY="<your own admin secret>"
+$env:AWS_DEFAULT_REGION="eu-central-1"
+cd terraform
+.\terraform init
+.\terraform apply -var="worker_alert_url=https://your-worker-domain/hit/<aws_canary_id>" -var="aws_region=eu-central-1"
+.\terraform output canary_access_key_id
+.\terraform output -raw canary_secret_access_key
+```
+
+Those environment variables only live in the current PowerShell window, and they are *your* credentials, not the decoy's. Use the same region in `$env:AWS_DEFAULT_REGION` and in `aws_region`. If `terraform` is on your PATH, drop the `.\`.
+
+To simulate an attacker without installing the AWS CLI, `pip install boto3` and run the decoy key through STS:
+
+```powershell
+python -c "import boto3; print(boto3.client('sts', aws_access_key_id='<decoy key id>', aws_secret_access_key='<decoy secret>', region_name='eu-central-1').get_caller_identity())"
+```
+
+The alert normally arrives within minutes, but CloudTrail delivery can be much slower -- see the AWS gotchas.
+
+Cleanup: `python honeytoken_cli.py clean --vault ./decoys/tokens_vault.json --yes`, then `.\terraform destroy` with the same `-var` values, from the folder you ran `apply` in.
+
+**WSL is an alternative.** If you'd rather follow the bash Quickstart, WSL works. `wsl --install` sets up WSL 2, which needs hardware virtualization to be enabled -- the same thing Docker Desktop needs. Microsoft's docs say WSL 1 doesn't need it (`wsl --set-default-version 1` before installing a distro); that route hasn't been tested with this project.
+
 ## Honest limitations
 
 - **Slack/Discord webhooks and the DB connection string are the reliable triggers.** They're just a URL and a socket -- anything touching them gets caught, full stop.
+- **A DB decoy on a public IP gets scanned within minutes, and today every connection alerts.** An open port 5432 attracts internet-wide scanners: plain HTTP and TLS probes, and logins with default usernames (`postgres`, `app`, `umami`). One test listener produced almost 300 Telegram alerts within a day, nearly all of them scanners, and the listener doesn't deduplicate or triage yet (see Roadmap). The alert means "someone connected to the port", not necessarily "someone used the leaked connection string". Until triage lands, mute that chat, put the DB decoy on an internal address, or accept the noise.
 - **A bare AWS key, Azure credential, or GitHub token doesn't call home by itself.** It's just a string. For AWS and Azure you need the respective Terraform module (see below). For GitHub there's no equivalent free path -- real audit-log monitoring on personal tokens is a GitHub Enterprise feature, not something you can bolt on for free.
-- **Dedup window is 5 minutes** per (canary_id, IP) pair, with a digest every 50th repeat. Cuts down noise from scanners a lot, doesn't eliminate it -- a distributed botnet hitting from different IPs will still generate separate alerts, and that's fine, that's actually the interesting case.
+- **The Worker's dedup window is 5 minutes** per (canary_id, IP) pair (the DB listener doesn't dedup yet), with a digest every 50th repeat. Cuts down noise from scanners a lot, doesn't eliminate it -- a distributed botnet hitting from different IPs will still generate separate alerts, and that's fine, that's actually the interesting case.
 - **This isn't a GitGuardian or Thinkst Canary replacement.** It's a lightweight thing for people who don't need (or can't justify) a whole platform for this one feature.
 
 ## AWS gotchas (learned by actually testing this, not by reading docs)
 
-I built the first version of the Terraform module assuming CloudTrail's free 90-day event history would feed EventBridge automatically. It doesn't. Two things had to be fixed after a full end-to-end test kept coming up silent on real AWS calls even though a manually crafted `aws events put-events` fired instantly:
+I built the first version of the Terraform module assuming CloudTrail's free 90-day event history would feed EventBridge automatically. It doesn't. Two things had to be fixed (a third turned up later -- see item 3) after a full end-to-end test kept coming up silent on real AWS calls even though a manually crafted `aws events put-events` fired instantly:
 
 1. **You need an actual CloudTrail Trail.** Events sitting in the free Event History (what `aws cloudtrail lookup-events` shows you) are *not* forwarded to EventBridge. Only events captured by a configured Trail are. The module now creates a minimal Trail with its own S3 bucket for log storage.
 
@@ -226,7 +342,7 @@ Enabling data event logging broadly (e.g. across all buckets in an account) can 
 
 Also worth knowing before you test:
 
-- **Match your region.** `variables.tf` defaults `aws_region` to `us-east-1`. If your AWS CLI profile defaults to something else, the honeytoken IAM user and the EventBridge rule end up in different regions relative to where you're checking, and everything looks broken when it's actually just split across two places. Pass `-var="aws_region=..."` explicitly and match it to your CLI's default region.
+- **Match your region.** `variables.tf` defaults `aws_region` to `us-east-1`. If your AWS CLI profile defaults to something else, the honeytoken IAM user and the EventBridge rule end up in different regions relative to where you're checking, and everything looks broken when it's actually just split across two places. Pass `-var="aws_region=..."` explicitly and match it to your CLI's default region. And don't assume any European-sounding region will do: `eu-central-1` (Frankfurt), `eu-north-1` (Stockholm) and `eu-west-1` (Ireland) are three separate regions, as far as AWS is concerned.
 - **Real CloudTrail delivery is slow.** Budget 15-25 minutes for the first real API call to show up as an alert -- CloudTrail -> S3 -> EventBridge has its own pipeline delay that has nothing to do with your setup. A manual `aws events put-events` test bypasses all of that and fires in seconds, which is a great way to confirm the Worker/Telegram side works, but it will NOT tell you whether the CloudTrail path is wired up correctly. Test both.
 - **`GetCallerIdentity` requires zero IAM permissions to succeed**, even for a deny-all user -- it's a built-in AWS exception. If you're simulating an attacker probing the key, use something that actually returns `AccessDenied`, like `aws s3 ls`. Both get logged either way, but AccessDenied is a more honest simulation and shows up cleaner in the alert.
 
@@ -285,8 +401,8 @@ That discovery also surfaced a real false-positive source, now fixed: Event Grid
 - Fix Azure detection -- either scope the honeytoken a narrow real permission on a decoy resource group so calls reach a resource provider and get logged, or pay for Entra ID P1 and use Sign-in Logs (see the Azure section above for the full story on why the current zero-permission approach doesn't get logged by Activity Log, and why the free alternatives were dead ends)
 - **Known issue, not urgent:** `honeytoken generate` regenerates *all* five decoy types every time it runs, including new random `canary_id`s for ones you might not have touched. If you've already deployed AWS (or Azure) infrastructure pointing at a specific `canary_id` and then re-run `generate` for an unrelated reason (e.g. to pick up a new decoy type after an update), the vault file drifts out of sync with what's actually deployed -- the deployed infrastructure keeps working, but the vault stops being a reliable source of truth for it. Worth adding a `--only` flag to regenerate a single token type without touching the rest.
 - One-command setup that wraps the CLI, `wrangler deploy`, and Terraform behind a single script or container, so this doesn't require five separate tools installed locally -- the current setup assumes a comfort level with CLIs that not every small team has
-- Harden `fake_postgres_listener.py` against real internet-facing scanning: move to async I/O instead of one thread per connection (matters if this ever sits on a public IP and gets hit by mass scanners like Shodan/Masscan), plus a Docker healthcheck and resource limits so a flood of connection attempts can't take down the host
-- More decoy formats -- `.npmrc` / `.piprc` (fake private registry credentials), `kubeconfig` / `docker/config.json` (fake cluster and registry access), and DNS-based canaries (alert when an attacker resolves a hostname that shouldn't exist)
+- Harden `fake_postgres_listener.py` against real internet-facing scanning, which a test on a public IP showed is not hypothetical (about 300 alerts in a day): per-IP deduplication, labeling what each connection is (HTTP probe, TLS probe, Postgres SSL request, login attempt), and alerting loudly only when a login uses the decoy's own username and database; then async I/O instead of one thread per connection, a Docker healthcheck, and resource limits so a flood of connection attempts can't take down the host
+- More decoy formats -- `.npmrc` / `.piprc` (fake private registry credentials), `kubeconfig` / `docker/config.json` (fake cluster and registry access), and DNS-based canaries (alert when an attacker resolves a hostname that shouldn't exist). To be upfront: Thinkst's Canarytokens already offers kubeconfig and DNS tokens, so the point here is integrating them into this self-hosted pipeline, not claiming a new token type; `.npmrc` appears to be uncovered elsewhere
 - Encrypt `tokens_vault.json` at rest instead of storing it as plaintext JSON
 - IP geolocation via a proper API for more accurate alerts
 - Scheduled token rotation
