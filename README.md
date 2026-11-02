@@ -434,6 +434,15 @@ That discovery also surfaced a real false-positive source, now fixed: Event Grid
 - Scheduled token rotation
 - Export alerts to a SIEM (Splunk/ELK) alongside Telegram
 
+## Tests
+
+Offline tests that need no Telegram, Cloudflare, AWS or VPS (Telegram, KV and the geo lookup are stubbed):
+
+    python3 tests/test_listener.py   # Python 3.11+ and the `openssl` command
+    node tests/test_worker.mjs       # Node 18+
+
+They cover traffic classification, dedup, alert delivery (HTML, plain-text fallback, retries, KV failures) and sanitising of attacker-controlled input. They don't replace live tests against real Cloudflare, Telegram, AWS or Azure.
+
 ## Contributing
 
 Issues and PRs welcome — especially around the GitHub-token detection gap and the Azure Activity Log problem (see Honest limitations and the Azure section above) if anyone finds a free-tier path that was missed here. For anything non-trivial, open an issue first so we're aligned before you put work into a PR.
