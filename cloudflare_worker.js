@@ -9,6 +9,21 @@
  * (Shodan, Censys, random bots) don't bury you under a hundred
  * identical Telegram messages.
  *
+ * Reliability rules (a lost alert is the one failure a canary can't afford):
+ *  - Everything the attacker controls (path, User-Agent, method, body,
+ *    IDs) is cleaned and length-capped, then HTML-escaped. If Telegram
+ *    still rejects the formatted message, the same alert is re-sent as
+ *    plain text; network errors / 429 / 5xx are retried.
+ *  - KV problems never block an alert. The free plan allows 1,000 KV
+ *    writes per day and 1 write per second per key, so the Worker writes
+ *    to KV once per (canary, IP) window, not once per request; when a
+ *    write or read fails it relies on an in-memory dedup (per Worker
+ *    instance) and alerts anyway.
+ *  - If Telegram can't be reached at all, the dedup entry is removed so
+ *    the next hit from that IP alerts again instead of staying silent for
+ *    the whole window.
+ *  - The attacker always gets the same bland 200, even on internal errors.
+ *
  * Deploy:
  *   1) npm install -g wrangler
  *   2) wrangler login
@@ -17,11 +32,21 @@
  *   4) wrangler secret put TELEGRAM_BOT_TOKEN
  *   5) wrangler secret put TELEGRAM_CHAT_ID
  *   6) wrangler deploy
+ *
+ * Optional: CANARY_SHARED_SECRET (verifies the AWS pipeline payload),
+ * GEO_LOOKUP="0" (don't send alerting IPs to ip-api.com).
  */
 
 // Dedup window: repeat hits from the same IP against the same canary_id
 // inside this window don't send a new message, just bump a counter.
 const DEDUP_WINDOW_SECONDS = 300; // 5 minutes
+const DIGEST_EVERY = 50;
+const MAX_FIELD_LEN = 200;        // attacker-controlled strings are cut to this
+const BODY_READ_LIMIT = 4096;     // bytes of the request body we ever read
+const TELEGRAM_ATTEMPTS = 3;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const windowMinutes = () => Math.round(DEDUP_WINDOW_SECONDS / 60);
 
 export default {
   async fetch(request, env, ctx) {
@@ -37,105 +62,339 @@ export default {
       return new Response("Not Found", { status: 404 });
     }
 
-    const canaryId = path.split("/")[2] || "unknown";
-
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-    const ua = request.headers.get("User-Agent") || "unknown";
-    const country = request.cf?.country || "unknown";
-    const city = request.cf?.city || "unknown";
-    const asn = request.cf?.asn || "unknown";
-    const method = request.method;
-    const now = new Date().toISOString();
-
-    let bodyPreview = "";
     try {
-      const text = await request.text();
-      bodyPreview = text.slice(0, 500);
+      await handleHit(request, env, ctx, path);
     } catch (e) {
-      bodyPreview = "(could not read request body)";
-    }
-
-    // --- Dedup / rate limit via KV ---
-    const dedupKey = `dedup:${canaryId}:${ip}`;
-    const decision = await checkAndUpdateDedup(env, dedupKey);
-
-    if (decision.shouldAlert) {
-      const message = buildAlertMessage({
-        canaryId, path, method, ip, country, city, asn, ua, now, bodyPreview,
-        repeatCount: decision.previousCount,
-      });
-      ctx.waitUntil(sendTelegramAlert(env, message));
-    } else {
-      // Not the first hit in this window -- just count it, don't spam.
-      // Every 50 repeats we send a short digest so you know the attack
-      // is still ongoing without flooding the channel.
-      if (decision.shouldSendDigest) {
-        const digest =
-          `🔁 *Repeated hits*\n\n` +
-          `*Canary ID:* \`${canaryId}\`\n` +
-          `*IP:* \`${ip}\`\n` +
-          `This IP made *${decision.previousCount}* more request(s) in the last ${Math.round(DEDUP_WINDOW_SECONDS / 60)} min.\n` +
-          `*Time (UTC):* ${now}`;
-        ctx.waitUntil(sendTelegramAlert(env, digest));
-      }
+      // Never let an internal error change what the caller sees.
+      console.error("[honeytoken] unexpected error while handling a hit:", (e && e.stack) || e);
     }
 
     // Respond with something bland and plausible -- no reason to tip
     // off whoever's poking at this that it's a trap.
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+    return blandOk();
   },
 };
 
-/**
- * Dedup logic:
- *  - If the key (canary_id + IP) hasn't been seen in the last
- *    DEDUP_WINDOW_SECONDS, this is a fresh hit -> send the full alert,
- *    start the counter at 0.
- *  - If it has -- bump the counter, skip the alert.
- *  - Every 50th repeat, send a short digest so the attack doesn't just
- *    disappear into silence.
- */
-async function checkAndUpdateDedup(env, key) {
-  if (!env.HONEYTOKEN_KV) {
-    // KV isn't bound (e.g. local dev without --remote) -- treat as
-    // no dedup and always alert.
-    return { shouldAlert: true, shouldSendDigest: false, previousCount: 0 };
-  }
-
-  const raw = await env.HONEYTOKEN_KV.get(key);
-
-  if (raw === null) {
-    await env.HONEYTOKEN_KV.put(key, "1", { expirationTtl: DEDUP_WINDOW_SECONDS });
-    return { shouldAlert: true, shouldSendDigest: false, previousCount: 0 };
-  }
-
-  const count = parseInt(raw, 10) + 1;
-  await env.HONEYTOKEN_KV.put(key, String(count), { expirationTtl: DEDUP_WINDOW_SECONDS });
-
-  const shouldSendDigest = count % 50 === 0;
-  return { shouldAlert: false, shouldSendDigest, previousCount: count };
+function blandOk() {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-function buildAlertMessage({ canaryId, path, method, ip, country, city, asn, ua, now, bodyPreview, repeatCount }) {
-  return (
-    `🚨 *HONEYTOKEN TRIGGERED*\n\n` +
-    `*Canary ID:* \`${canaryId}\`\n` +
-    `*Path:* \`${path}\`\n` +
-    `*Method:* ${method}\n` +
-    `*IP:* \`${ip}\`\n` +
-    `*Country/City:* ${country} / ${city}\n` +
-    `*ASN:* ${asn}\n` +
-    `*User-Agent:* \`${ua}\`\n` +
-    `*Time (UTC):* ${now}\n` +
-    (bodyPreview ? `*Body preview:*\n\`\`\`${bodyPreview}\`\`\`\n` : "") +
-    `_Further hits from this IP in the next ${Math.round(DEDUP_WINDOW_SECONDS / 60)} min will be aggregated._`
+async function handleHit(request, env, ctx, path) {
+  const canaryId = clean(path.split("/")[2] || "unknown", 64);
+
+  const ip = clean(request.headers.get("CF-Connecting-IP") || "unknown", 64);
+  const ua = clean(request.headers.get("User-Agent") || "unknown");
+  const country = clean(request.cf?.country || "unknown", 40);
+  const city = clean(request.cf?.city || "unknown", 60);
+  const asn = clean(request.cf?.asn || "unknown", 20);
+  const method = clean(request.method, 24);
+  const now = new Date().toISOString();
+
+  const rawBody = await readBody(request);
+  const bodyPreview = clean(rawBody, 500);
+
+  // The AWS pipeline (EventBridge API Destination) delivers CloudTrail
+  // details as a small body. Everything in the request headers then
+  // describes AWS, not the attacker -- the attacker's IP is in the body.
+  const aws = parseAwsPayload(rawBody);
+  const trusted = Boolean(
+    aws && env.CANARY_SHARED_SECRET &&
+    request.headers.get("X-Canary-Secret") === env.CANARY_SHARED_SECRET
+  );
+  // Only key the dedup on the IP from the body when the payload is
+  // authenticated; otherwise anyone could dodge dedup (or flood the chat)
+  // by inventing source_ip values.
+  const dedupIp = trusted ? clean(aws.sourceIp, 64) : ip;
+
+  // --- Dedup / rate limit via KV (never blocks the alert) ---
+  const dedupKey = `dedup:${canaryId}:${dedupIp}`;
+  const decision = await checkAndUpdateDedup(env, dedupKey);
+
+  if (decision.shouldAlert) {
+    ctx.waitUntil(alertAndTrack(env, dedupKey, async () => {
+      if (aws) {
+        const geo = await lookupGeo(env, aws.sourceIp);
+        return buildAwsAlert({ canaryId, aws, trusted, ip, ua, geo });
+      }
+      return buildHitAlert({ canaryId, path, method, ip, country, city, asn, ua, now, bodyPreview });
+    }));
+  } else if (decision.shouldSendDigest) {
+    // Not the first hit in this window -- just count it, don't spam.
+    // Every 50 repeats we send a short digest so you know the attack
+    // is still ongoing without flooding the channel.
+    const digest = renderAlert(
+      "🔁 Repeated hits",
+      [["Canary ID", canaryId], ["IP", dedupIp], ["Time (UTC)", now]],
+      `This IP made ${decision.previousCount} more request(s) in the last ${windowMinutes()} min.`
+    );
+    ctx.waitUntil(sendTelegramAlert(env, digest).catch((e) =>
+      console.error("[honeytoken] digest failed:", (e && e.message) || e)));
+  }
+}
+
+// --------------------------------------------------------------------
+// Text safety. Path, User-Agent, method, body and IDs come from whoever
+// hit the honeytoken. Strip control/bidi characters (no forged log lines,
+// no invisible text) and cap the length (Telegram refuses messages over
+// 4096 characters).
+// --------------------------------------------------------------------
+
+function clean(value, maxLen = MAX_FIELD_LEN) {
+  let s = String(value)
+    .replace(/\s*[\r\n]+\s*/g, " ⏎ ")
+    .replace(/\t/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "?");
+  if (s.length > maxLen) s = s.slice(0, maxLen - 1) + "…";
+  return s;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Returns { html, plain } for the same alert. Values must already be clean()ed. */
+function renderAlert(title, fields = [], note = "") {
+  const h = [`<b>${esc(title)}</b>`, ""];
+  const p = [title, ""];
+  for (const [label, value] of fields) {
+    h.push(`<b>${esc(label)}:</b> <code>${esc(value)}</code>`);
+    p.push(`${label}: ${value}`);
+  }
+  if (note) {
+    h.push("", `<i>${esc(note)}</i>`);
+    p.push("", note);
+  }
+  return { html: h.join("\n"), plain: p.join("\n") };
+}
+
+/** Read at most BODY_READ_LIMIT bytes of the body, so a huge upload can't exhaust memory. */
+async function readBody(request, limit = BODY_READ_LIMIT) {
+  try {
+    if (!request.body) return "";
+    const reader = request.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
+    }
+    try { await reader.cancel(); } catch (e) { /* body already consumed */ }
+    const bytes = new Uint8Array(Math.min(total, limit));
+    let offset = 0;
+    for (const chunk of chunks) {
+      const take = Math.min(chunk.length, bytes.length - offset);
+      bytes.set(chunk.subarray(0, take), offset);
+      offset += take;
+      if (offset >= bytes.length) break;
+    }
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  } catch (e) {
+    return "(could not read request body)";
+  }
+}
+
+// --------------------------------------------------------------------
+// Dedup
+// --------------------------------------------------------------------
+
+/**
+ * Dedup logic (window = DEDUP_WINDOW_SECONDS, counted from the first hit):
+ *  - Fresh key (canary_id + IP not seen in the window) -> send the full alert.
+ *  - Seen already -> skip the alert and count it.
+ *  - Every 50th repeat, send a short digest so the attack doesn't just
+ *    disappear into silence.
+ *
+ * Two layers, because KV has no atomic check-and-set: several requests that
+ * arrive at the same moment would all read "not seen yet" and all alert.
+ *  1. In-memory, per Worker instance. JavaScript runs one step at a time and
+ *     memDedup() never awaits, so a burst handled by one instance alerts once.
+ *  2. KV, shared by all instances (and by this instance after it restarts).
+ *     Asked only the first time an instance sees a key, and written only
+ *     once per window, so repeats cost no KV writes (the free plan allows
+ *     1,000 writes/day, 1 write/s per key). If KV fails, memory decides.
+ * A burst spread over several instances can still alert more than once.
+ */
+async function checkAndUpdateDedup(env, key) {
+  const local = memDedup(key);
+  if (!local.shouldAlert) return local;      // repeat seen by this instance
+  if (!env.HONEYTOKEN_KV) return local;      // KV isn't bound (e.g. local dev): memory only
+
+  let raw;
+  try {
+    raw = await env.HONEYTOKEN_KV.get(key);
+  } catch (e) {
+    console.error("[honeytoken] KV read failed, using in-memory dedup:", (e && e.message) || e);
+    return local;
+  }
+  if (raw !== null) {
+    // Another instance already alerted for this key in the window.
+    return { shouldAlert: false, shouldSendDigest: false, previousCount: parseInt(raw, 10) || 1 };
+  }
+  await kvPut(env, key, "1"); // a failed write is fine: memory already remembers the key
+  return local;
+}
+
+async function kvPut(env, key, value) {
+  try {
+    await env.HONEYTOKEN_KV.put(key, value, { expirationTtl: DEDUP_WINDOW_SECONDS });
+    return true;
+  } catch (e) {
+    console.error("[honeytoken] KV write failed (free plan: 1,000 writes/day, 1 write/s per key):",
+      (e && e.message) || e);
+    return false;
+  }
+}
+
+// In-memory layer: per Worker instance. It makes a burst handled by one
+// instance alert once, and keeps a KV outage from turning every request
+// into an alert. It is an approximation across instances; KV covers those.
+const memState = new Map();
+
+function memDedup(key) {
+  const now = Date.now();
+  if (memState.size > 1000) {
+    for (const [k, v] of memState) {
+      if (now - v.start > DEDUP_WINDOW_SECONDS * 1000) memState.delete(k);
+    }
+    if (memState.size > 1000) memState.clear();
+  }
+  const entry = memState.get(key);
+  if (!entry || now - entry.start > DEDUP_WINDOW_SECONDS * 1000) {
+    memState.set(key, { start: now, count: 1 });
+    return { shouldAlert: true, shouldSendDigest: false, previousCount: 0 };
+  }
+  entry.count += 1;
+  return { shouldAlert: false, shouldSendDigest: entry.count % DIGEST_EVERY === 0, previousCount: entry.count };
+}
+
+/** Delivery failed: the dedup entry must not suppress the next attempt. */
+async function forgetDedup(env, key) {
+  memState.delete(key);
+  if (!env.HONEYTOKEN_KV) return;
+  try {
+    await env.HONEYTOKEN_KV.delete(key);
+  } catch (e) {
+    console.error("[honeytoken] could not clear dedup key:", (e && e.message) || e);
+  }
+}
+
+/** Build the alert, send it, and undo the dedup entry if it never reached Telegram. */
+async function alertAndTrack(env, dedupKey, buildAlert) {
+  try {
+    const alert = await buildAlert();
+    const status = await sendTelegramAlert(env, alert);
+    if (status === "failed") await forgetDedup(env, dedupKey);
+  } catch (e) {
+    console.error("[honeytoken] alert failed:", (e && e.stack) || e);
+    await forgetDedup(env, dedupKey);
+  }
+}
+
+// --------------------------------------------------------------------
+// Alert content
+// --------------------------------------------------------------------
+
+/**
+ * Pull the fields out of the AWS payload with regexes rather than JSON.parse:
+ * the EventBridge input template leaves `error_code` empty (no quotes) when
+ * the call succeeded, e.g. GetCallerIdentity, which makes the body invalid
+ * JSON -- exactly the kind of call an attacker makes first.
+ */
+function parseAwsPayload(text) {
+  if (!/"source"\s*:\s*"aws-cloudtrail-honeytoken"/.test(text)) return null;
+  const field = (key) => {
+    const m = text.match(new RegExp(`"${key}"\\s*:\\s*"([^"]{0,200})"`));
+    return m ? m[1] : "";
+  };
+  return {
+    sourceIp: field("source_ip") || "unknown",
+    apiCall: field("api_call") || "unknown",
+    iamUser: field("iam_user") || "unknown",
+    eventTime: field("event_time") || "unknown",
+    errorCode: field("error_code"),
+  };
+}
+
+/** Country/city/provider for an IP, via ip-api.com (free, HTTP-only, rate-limited).
+ *  The attacker's IP goes to a third party; set the GEO_LOOKUP variable to "0" to disable.
+ *  Returns [[label, value], ...] ([] if off or failed). */
+async function lookupGeo(env, ip) {
+  if (env.GEO_LOOKUP === "0") return [];
+  if (!/^[0-9a-fA-F:.]{3,45}$/.test(ip)) return [];
+  try {
+    const res = await fetch(
+      `http://ip-api.com/json/${ip}?fields=status,country,city,isp,as,hosting,proxy`,
+      { signal: AbortSignal.timeout(3000) }
+    );
+    const d = await res.json();
+    if (d.status !== "success") return [];
+    const flags = ["hosting", "proxy"].filter((k) => d[k]);
+    const out = [
+      ["Country/City", `${clean(d.country || "?", 40)} / ${clean(d.city || "?", 40)}`],
+      ["Provider", clean(d.isp || "?", 80)],
+      ["ASN", clean(d.as || "?", 80)],
+    ];
+    if (flags.length) out.push(["Flags", flags.join(", ")]);
+    return out;
+  } catch (e) {
+    return [];
+  }
+}
+
+function buildAwsAlert({ canaryId, aws, trusted, ip, ua, geo }) {
+  const fields = [
+    ["Attacker IP", clean(aws.sourceIp, 64)],
+    ...geo,
+    ["AWS call", clean(aws.apiCall, 100)],
+    ["Result", aws.errorCode ? clean(aws.errorCode, 100) : "succeeded"],
+    ["IAM user", clean(aws.iamUser)],
+    ["Event time (UTC)", clean(aws.eventTime, 40)],
+    ["Canary ID", canaryId],
+    ["Delivered by", `${ip} (${ua})`],
+  ];
+  const note =
+    (trusted
+      ? ""
+      : "Payload not authenticated, so the attacker IP above is as reported in the request body. " +
+        "Set CANARY_SHARED_SECRET (Worker) and worker_shared_secret (Terraform) to verify it.\n") +
+    `Further hits for this IP in the next ${windowMinutes()} min will be aggregated.`;
+  return renderAlert("🚨 HONEYTOKEN: AWS KEY USED", fields, note);
+}
+
+function buildHitAlert({ canaryId, path, method, ip, country, city, asn, ua, now, bodyPreview }) {
+  const fields = [
+    ["Canary ID", canaryId],
+    ["Path", clean(path)],
+    ["Method", method],
+    ["IP", ip],
+    ["Country/City", `${country} / ${city}`],
+    ["ASN", asn],
+    ["User-Agent", ua],
+    ["Time (UTC)", now],
+  ];
+  if (bodyPreview) fields.push(["Body preview", bodyPreview]);
+  return renderAlert(
+    "🚨 HONEYTOKEN TRIGGERED",
+    fields,
+    `Further hits from this IP in the next ${windowMinutes()} min will be aggregated.`
   );
 }
 
-async function sendTelegramAlert(env, text) {
+// --------------------------------------------------------------------
+// Telegram delivery
+// --------------------------------------------------------------------
+
+/**
+ * Returns "sent", "failed" or "skipped" (no token configured).
+ * HTTP 400 (formatting) -> resend as plain text right away;
+ * network error / 429 / 5xx -> retry with a short pause.
+ */
+async function sendTelegramAlert(env, alert) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) {
@@ -145,19 +404,47 @@ async function sendTelegramAlert(env, text) {
     // or the dashboard's live logs if alerts aren't showing up --
     // this line is what you're looking for.
     console.error("[honeytoken] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set -- run `wrangler secret put TELEGRAM_BOT_TOKEN` / `wrangler secret put TELEGRAM_CHAT_ID`");
-    return;
+    return "skipped";
   }
 
   const apiUrl = `https://api.telegram.org/bot${token}/sendMessage`;
-  await fetch(apiUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "Markdown",
-    }),
-  });
+  let useHtml = true;
+
+  for (let attempt = 1; attempt <= TELEGRAM_ATTEMPTS; attempt++) {
+    const payload = { chat_id: chatId, text: useHtml ? alert.html : alert.plain };
+    if (useHtml) payload.parse_mode = "HTML";
+    let delayMs = 1000 * attempt;
+
+    try {
+      const res = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) return "sent";
+
+      const body = await res.text().catch(() => "");
+      console.error(`[honeytoken] Telegram HTTP ${res.status} (attempt ${attempt}/${TELEGRAM_ATTEMPTS}): ${body.slice(0, 300)}`);
+      if (res.status === 400) {
+        if (useHtml) { useHtml = false; continue; } // formatting problem: plain text now
+        return "failed";                            // plain text refused too (e.g. wrong chat id)
+      }
+      if (res.status === 401 || res.status === 403 || res.status === 404) {
+        return "failed";                            // bad token / bot removed: retrying can't help
+      }
+      if (res.status === 429) {
+        try {
+          const retryAfter = JSON.parse(body)?.parameters?.retry_after;
+          if (retryAfter) delayMs = retryAfter * 1000;
+        } catch (e) { /* keep the default delay */ }
+      }
+    } catch (e) {
+      console.error(`[honeytoken] Telegram send failed (attempt ${attempt}/${TELEGRAM_ATTEMPTS}):`, (e && e.message) || e);
+    }
+    if (attempt < TELEGRAM_ATTEMPTS) await sleep(Math.min(delayMs, 5000));
+  }
+  return "failed";
 }
 
 /**
@@ -189,7 +476,7 @@ async function sendTelegramAlert(env, text) {
  * report back what needed fixing.
  */
 async function handleAzureEventGrid(request, env, ctx, path) {
-  const canaryId = path.split("/")[2] || "unknown";
+  const canaryId = clean(path.split("/")[2] || "unknown", 64);
 
   let events;
   try {
@@ -204,7 +491,7 @@ async function handleAzureEventGrid(request, env, ctx, path) {
 
   // Validation handshake: respond synchronously, don't alert on this.
   const validationEvent = events.find(
-    (e) => e.eventType === "Microsoft.EventGrid.SubscriptionValidationEvent"
+    (e) => e && e.eventType === "Microsoft.EventGrid.SubscriptionValidationEvent"
   );
   if (validationEvent) {
     const validationCode = validationEvent.data?.validationCode;
@@ -214,59 +501,66 @@ async function handleAzureEventGrid(request, env, ctx, path) {
     });
   }
 
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  const now = new Date().toISOString();
+  try {
+    const ip = clean(request.headers.get("CF-Connecting-IP") || "unknown", 64);
+    const now = new Date().toISOString();
 
-  for (const event of events) {
-    // Event Grid's own system/control-plane notifications (subscription created,
-    // updated, deleted, etc.) come through this same webhook and look just like
-    // a real event -- confirmed in testing when deleting a Storage Account
-    // cascaded into an Event Grid subscription teardown, which fired a
-    // SubscriptionDeletedEvent straight into this handler and generated a
-    // bogus alert. None of these carry actual Activity Log data (appid,
-    // caller, etc. all come back "unknown"), so skip anything in this family
-    // rather than trying to keep an exhaustive list of every lifecycle event
-    // name Microsoft might send.
-    if (event.eventType && event.eventType.startsWith("Microsoft.EventGrid.")) {
-      continue;
+    for (const event of events) {
+      if (!event) continue;
+      // Event Grid's own system/control-plane notifications (subscription created,
+      // updated, deleted, etc.) come through this same webhook and look just like
+      // a real event -- confirmed in testing when deleting a Storage Account
+      // cascaded into an Event Grid subscription teardown, which fired a
+      // SubscriptionDeletedEvent straight into this handler and generated a
+      // bogus alert. None of these carry actual Activity Log data (appid,
+      // caller, etc. all come back "unknown"), so skip anything in this family
+      // rather than trying to keep an exhaustive list of every lifecycle event
+      // name Microsoft might send.
+      if (event.eventType && String(event.eventType).startsWith("Microsoft.EventGrid.")) {
+        continue;
+      }
+
+      const data = event.data || {};
+      const appId = clean(data.claims?.appid || data.claims?.appId || "unknown", 64);
+      const caller = clean(data.caller || "unknown");
+      const eventName = clean(data.eventName?.value || data.eventName || event.eventType || "unknown", 100);
+      const status = clean(data.status?.value || data.status || "unknown", 60);
+      const resourceId = clean(data.resourceId || "unknown");
+
+      const dedupKey = `dedup-azure:${canaryId}:${appId}`;
+      const decision = await checkAndUpdateDedup(env, dedupKey);
+
+      if (decision.shouldAlert) {
+        ctx.waitUntil(alertAndTrack(env, dedupKey, async () => renderAlert(
+          "🚨 AZURE HONEYTOKEN TRIGGERED",
+          [
+            ["Canary ID", canaryId],
+            ["App (client) ID used", appId],
+            ["Caller", caller],
+            ["API call", eventName],
+            ["Status", status],
+            ["Resource", resourceId],
+            ["Delivered from IP", ip],
+            ["Time (UTC)", now],
+          ],
+          "Delivered from IP is Azure's own IP, not necessarily the attacker's -- Activity Log entries " +
+          "sometimes include a caller IP in data.httpRequest.clientIpAddress, but this wasn't verified " +
+          "end-to-end; check the raw event data if you need the real source IP.\n" +
+          `Further hits from this app ID in the next ${windowMinutes()} min will be aggregated.`
+        )));
+      } else if (decision.shouldSendDigest) {
+        const digest = renderAlert(
+          "🔁 Repeated Azure hits",
+          [["Canary ID", canaryId], ["App (client) ID", appId], ["Time (UTC)", now]],
+          `This app ID made ${decision.previousCount} more call(s) in the last ${windowMinutes()} min.`
+        );
+        ctx.waitUntil(sendTelegramAlert(env, digest).catch((e) =>
+          console.error("[honeytoken] digest failed:", (e && e.message) || e)));
+      }
     }
-
-    const data = event.data || {};
-    const appId = data.claims?.appid || data.claims?.appId || "unknown";
-    const caller = data.caller || "unknown";
-    const eventName = data.eventName?.value || data.eventName || event.eventType || "unknown";
-    const status = data.status?.value || data.status || "unknown";
-    const resourceId = data.resourceId || "unknown";
-
-    const dedupKey = `dedup-azure:${canaryId}:${appId}`;
-    const decision = await checkAndUpdateDedup(env, dedupKey);
-
-    if (decision.shouldAlert) {
-      const message =
-        `🚨 *AZURE HONEYTOKEN TRIGGERED*\n\n` +
-        `*Canary ID:* \`${canaryId}\`\n` +
-        `*App (client) ID used:* \`${appId}\`\n` +
-        `*Caller:* \`${caller}\`\n` +
-        `*API call:* ${eventName}\n` +
-        `*Status:* ${status}\n` +
-        `*Resource:* \`${resourceId}\`\n` +
-        `*Delivered from IP:* \`${ip}\` (this is Azure's own IP, not necessarily the attacker's -- Activity Log entries sometimes include a caller IP in \`data.httpRequest.clientIpAddress\`, but this wasn't verified end-to-end; check the raw event data if you need the real source IP)\n` +
-        `*Time (UTC):* ${now}\n` +
-        `_Further hits from this app ID in the next ${Math.round(DEDUP_WINDOW_SECONDS / 60)} min will be aggregated._`;
-      ctx.waitUntil(sendTelegramAlert(env, message));
-    } else if (decision.shouldSendDigest) {
-      const digest =
-        `🔁 *Repeated Azure hits*\n\n` +
-        `*Canary ID:* \`${canaryId}\`\n` +
-        `*App (client) ID:* \`${appId}\`\n` +
-        `This app ID made *${decision.previousCount}* more call(s) in the last ${Math.round(DEDUP_WINDOW_SECONDS / 60)} min.\n` +
-        `*Time (UTC):* ${now}`;
-      ctx.waitUntil(sendTelegramAlert(env, digest));
-    }
+  } catch (e) {
+    console.error("[honeytoken] unexpected error while handling an Azure event:", (e && e.stack) || e);
   }
 
-  return new Response(JSON.stringify({ ok: true }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
+  return blandOk();
 }

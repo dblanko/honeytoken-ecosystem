@@ -1,6 +1,6 @@
 # Honeytoken Ecosystem
 
-A small, self-hosted toolkit for generating and monitoring honeytokens: fake API keys, webhooks, and DB connection strings that you scatter around your repos, configs, and CI. Nobody legitimate ever touches these. If one gets used, you get a Telegram alert with the attacker's IP, geo, and user agent within seconds (or, for the AWS path, within a somewhat annoying number of minutes -- more on that below).
+A small, self-hosted toolkit for generating and monitoring honeytokens: fake API keys, webhooks, and DB connection strings that you scatter around your repos, configs, and CI. Nobody legitimate ever touches these. If one gets used, you get a Telegram alert with the attacker's IP, geo, and user agent within seconds (the AWS path depends on CloudTrail delivery: seconds in two recent test runs, up to 15-25 minutes in earlier ones -- more on that below).
 
 Zero infrastructure cost if you stay on free tiers: generation is a local Python CLI, the catcher runs on Cloudflare Workers (100k requests/day free), and the optional cloud integrations (AWS or Azure) are just an identity with zero permissions plus that cloud's native event pipeline -- no Lambda, no Azure Function, no server to babysit.
 
@@ -30,7 +30,7 @@ Nothing here is expensive, but there's more setup than the Quickstart alone lets
 
 **Tools you'll need installed locally:**
 
-- **Python 3.8+** and `pip` -- always required, this is what runs `honeytoken_cli.py`
+- **Python 3.8+** and `pip` -- always required, this is what runs `honeytoken_cli.py` (the DB listener needs **Python 3.11+** only if you run it without Docker -- the Docker image already has it)
 - **Node.js + npm** -- required to install `wrangler` (Cloudflare's CLI), which you need for step 2 below no matter what
 - **Docker** -- only if you're using the DB honeytoken
 - **Terraform CLI + AWS CLI** -- only if you're using the AWS honeytoken
@@ -63,7 +63,8 @@ flowchart LR
 
     subgraph Trigger["3. Trigger"]
         Attacker(["Attacker"])
-        Worker["Cloudflare Worker<br/>+ KV rate-limit"]
+        Worker["Cloudflare Worker<br/>+ dedup (memory + KV)"]
+        Listener["fake_postgres_listener.py<br/>(Docker on a VPS)"]
         CT["CloudTrail<br/>+ EventBridge"]
         AL["Activity Log<br/>+ Event Grid"]
     end
@@ -78,17 +79,19 @@ flowchart LR
     Repo -->|"leaked"| Attacker
     AWSUser -->|"key leaked"| Attacker
     AzureSP -->|"secret leaked"| Attacker
-    Attacker -->|"uses webhook / DB DSN"| Worker
+    Attacker -->|"uses webhook URL"| Worker
+    Attacker -->|"connects with DB DSN"| Listener
     Attacker -->|"calls AWS API"| CT
     Attacker -->|"calls Azure API"| AL
     CT -->|"POST via API Destination"| Worker
     AL -.->|"POST via Event Grid<br/>(does not currently fire — see below)"| Worker
     Worker -->|"enrich: IP, geo, UA, dedup"| TG
+    Listener -->|"classify, dedup, enrich: IP, geo"| TG
 ```
 
 ## Demo
 
-A leaked webhook, DB connection string, or AWS key gets used → an alert lands in Telegram within seconds (AWS is the exception — see the CloudTrail gotchas below; Azure currently doesn't fire at all — see the Azure section below).
+A leaked webhook, DB connection string, or AWS key gets used → an alert lands in Telegram within seconds (AWS timing depends on CloudTrail delivery — see the gotchas below; Azure currently doesn't fire at all — see the Azure section below).
 
 <table>
 <tr>
@@ -104,7 +107,7 @@ A leaked webhook, DB connection string, or AWS key gets used → an alert lands 
 <td><img src="docs/screenshots/alert-aws-cloudtrail.png" width="400" alt="AWS CloudTrail alert"></td>
 </tr>
 <tr>
-<td align="center"><sub>Postgres DSN connection attempt</sub></td>
+<td align="center"><sub>Postgres DSN used: a real client logged in with the decoy user</sub></td>
 <td align="center"><sub>AWS honeytoken key used, caught via CloudTrail → EventBridge</sub></td>
 </tr>
 </table>
@@ -114,8 +117,8 @@ A leaked webhook, DB connection string, or AWS key gets used → an alert lands 
 | File / directory | What it does |
 |---|---|
 | `honeytoken_cli.py` | CLI: `generate` (create decoys), `clean` (wipe them), `ci-env` (dump values for CI secrets) |
-| `cloudflare_worker.js` | Serverless catcher for HTTP-based triggers, with KV-backed dedup |
-| `fake_postgres_listener.py` | TCP listener for the DB honeytoken (runs fine in Docker) |
+| `cloudflare_worker.js` | Serverless catcher for HTTP-based triggers, with dedup (in-memory plus KV), HTML alerts with a plain-text fallback, and retries |
+| `fake_postgres_listener.py` | Fake Postgres endpoint for the DB honeytoken: classifies every connection (decoy login, other login, SSL probe, scanner noise) and alerts only on the decoy login (runs fine in Docker) |
 | `Dockerfile`, `docker-compose.yml` | Packaging for the DB listener only -- doesn't cover the Worker, CLI, or Terraform |
 | `terraform/` | AWS: IAM user with no permissions + CloudTrail (with a data-event selector scoped to a decoy S3 bucket) + EventBridge -> Worker, no Lambda |
 | `azure/` | Azure: App Registration + Service Principal with zero roles + Event Grid on Activity Log -> Worker. Deploys cleanly but the core detection does not currently work -- see the Azure section below for what was tested and why |
@@ -190,7 +193,26 @@ python3 honeytoken_cli.py ci-env --format github-actions
 
 ```bash
 cp .env.example .env   # fill in TELEGRAM_*
-docker compose up -d
+docker compose up -d --build
+```
+
+On start the listener sends one "HONEYTOKEN DB LISTENER STARTED" message to Telegram. If it doesn't arrive, the token or chat id in `.env` is wrong (the container log says so), and real alerts won't arrive either. The hostname in the DSN must resolve to this machine (an A record pointing at the VPS) and port 5432 must be reachable.
+
+**Which logins count as the decoy.** Decoys made by `honeytoken_cli.py` use a user like `svc_xxxxxx` and a database like `prod_xxxxx`. The listener recognises that shape on its own, so there is nothing to configure. If your DSN uses other names, uncomment `DECOY_USERS` / `DECOY_DATABASES` in `.env` and put the exact user and database from the DSN there (random names only -- never `postgres`, `admin`, `test`). A match on either one is enough.
+
+**What alerts and what doesn't:**
+
+| Traffic | Result |
+|---|---|
+| A Postgres login with the decoy user or database | Telegram alert (user, database, TLS, IP, geo, provider) |
+| A Postgres login with any other user (`postgres`, `app`, ...) | `[login-scan]` in the container log only |
+| SSL request, then hang-up before any login | `[ssl-probe]` in the log only |
+| HTTP, bare TLS handshakes, SMB/SIP/RTSP probes, empty connections | `[noise]` in the log only |
+
+To test it, connect with the `connection_string` from `decoys/tokens_vault.json`: `psql "<connection_string>"` produces one alert (psql then reports a connection error -- expected, the listener isn't a real database). Logging in as `postgres` instead only writes `[login-scan]` to the log. To see what the internet has been throwing at the port:
+
+```bash
+docker compose logs --since 24h | grep -Eo '\[(login-scan|ssl-probe|noise|limit)\]' | sort | uniq -c
 ```
 
 Three things that trip people up here:
@@ -322,10 +344,12 @@ Cleanup: `python honeytoken_cli.py clean --vault ./decoys/tokens_vault.json --ye
 
 ## Honest limitations
 
-- **Slack/Discord webhooks and the DB connection string are the reliable triggers.** They're just a URL and a socket -- anything touching them gets caught, full stop.
-- **A DB decoy on a public IP gets scanned within minutes, and today every connection alerts.** An open port 5432 attracts internet-wide scanners: plain HTTP and TLS probes, and logins with default usernames (`postgres`, `app`, `umami`). One test listener produced almost 300 Telegram alerts within a day, nearly all of them scanners, and the listener doesn't deduplicate or triage yet (see Roadmap). The alert means "someone connected to the port", not necessarily "someone used the leaked connection string". Until triage lands, mute that chat, put the DB decoy on an internal address, or accept the noise.
+- **Slack/Discord webhooks are the most reliable trigger.** They're just a URL -- anything touching them gets caught, full stop. The DB connection string is just as reliable for anyone who actually uses it (see the next point).
+- **A DB decoy on a public IP gets scanned within minutes, so the listener only alerts on the decoy login.** An open port 5432 attracts internet-wide scanners: plain HTTP and TLS probes, SMB/RTSP/SIP probes, and logins with default usernames (`postgres`, `app`, `umami`). All of that is classified and written to the container log (`[noise]`, `[ssl-probe]`, `[login-scan]`) and none of it reaches Telegram -- only a login with the decoy's own user or database does. The trade-off: someone who takes only the host from the DSN and logs in as `postgres` isn't alerted (set `ALERT_ON_UNMATCHED=1` if you want those too, and expect noise). So far this was verified with my own connections and CI runs; I haven't yet seen a third party use a leaked DSN.
+- **DB listener details worth knowing.** The default shape (`svc_` + 6 lowercase letters, `prod_` + 5) can match by coincidence if a bot happens to try such a name -- set explicit random `DECOY_USERS` / `DECOY_DATABASES` if that worries you. The certificate is self-signed, so `sslmode=require` works but `verify-ca` / `verify-full` clients can't complete the handshake and won't be identified. Dedup is per source IP, in memory (5 minutes, a digest every 50th repeat) and resets when the container restarts. The alerting IP is looked up on ip-api.com over plain HTTP; set `GEO_LOOKUP=0` to turn that off (the Worker honours the same variable).
 - **A bare AWS key, Azure credential, or GitHub token doesn't call home by itself.** It's just a string. For AWS and Azure you need the respective Terraform module (see below). For GitHub there's no equivalent free path -- real audit-log monitoring on personal tokens is a GitHub Enterprise feature, not something you can bolt on for free.
-- **The Worker's dedup window is 5 minutes** per (canary_id, IP) pair (the DB listener doesn't dedup yet), with a digest every 50th repeat. Cuts down noise from scanners a lot, doesn't eliminate it -- a distributed botnet hitting from different IPs will still generate separate alerts, and that's fine, that's actually the interesting case.
+- **Dedup is best-effort.** The Worker's window is 5 minutes per (canary_id, IP) pair, with a digest every 50th repeat (the DB listener uses the same window per IP). It cuts down noise from scanners a lot, doesn't eliminate it -- a distributed botnet hitting from different IPs will still generate separate alerts, and that's fine, that's actually the interesting case. KV has no atomic check-and-set, so a burst that lands on several Worker instances at once can still produce more than one alert. Cloudflare's free KV plan allows 1,000 writes per day; the Worker writes once per window rather than per request, and if KV fails it falls back to in-memory dedup and still sends the alert -- an alert is never dropped because of KV.
+- **The AWS alert's source IP is only as trustworthy as the payload.** Unless `CANARY_SHARED_SECRET` (Worker) and `worker_shared_secret` (Terraform) are set, the Worker can't verify that the event came from your EventBridge rule, so the attacker IP in the alert is as reported in the request body, and anyone who knows the Worker URL could forge such an alert. The alert says so when the secret is missing.
 - **This isn't a GitGuardian or Thinkst Canary replacement.** It's a lightweight thing for people who don't need (or can't justify) a whole platform for this one feature.
 
 ## AWS gotchas (learned by actually testing this, not by reading docs)
@@ -343,7 +367,7 @@ Enabling data event logging broadly (e.g. across all buckets in an account) can 
 Also worth knowing before you test:
 
 - **Match your region.** `variables.tf` defaults `aws_region` to `us-east-1`. If your AWS CLI profile defaults to something else, the honeytoken IAM user and the EventBridge rule end up in different regions relative to where you're checking, and everything looks broken when it's actually just split across two places. Pass `-var="aws_region=..."` explicitly and match it to your CLI's default region. And don't assume any European-sounding region will do: `eu-central-1` (Frankfurt), `eu-north-1` (Stockholm) and `eu-west-1` (Ireland) are three separate regions, as far as AWS is concerned.
-- **Real CloudTrail delivery is slow.** Budget 15-25 minutes for the first real API call to show up as an alert -- CloudTrail -> S3 -> EventBridge has its own pipeline delay that has nothing to do with your setup. A manual `aws events put-events` test bypasses all of that and fires in seconds, which is a great way to confirm the Worker/Telegram side works, but it will NOT tell you whether the CloudTrail path is wired up correctly. Test both.
+- **CloudTrail delivery time varies.** In two recent CI test runs the alert arrived within the same minute as the API call, while earlier tests took 15-25 minutes, so budget for the longer case the first time. CloudTrail delivery has its own pipeline delay that has nothing to do with your setup. A manual `aws events put-events` test bypasses all of that and fires in seconds, which is a great way to confirm the Worker/Telegram side works, but it will NOT tell you whether the CloudTrail path is wired up correctly. Test both.
 - **`GetCallerIdentity` requires zero IAM permissions to succeed**, even for a deny-all user -- it's a built-in AWS exception. If you're simulating an attacker probing the key, use something that actually returns `AccessDenied`, like `aws s3 ls`. Both get logged either way, but AccessDenied is a more honest simulation and shows up cleaner in the alert.
 
 ## Azure module -- currently broken, here's exactly how and why
@@ -394,14 +418,16 @@ That discovery also surfaced a real false-positive source, now fixed: Event Grid
 - **`wrangler.toml` and TOML table ordering.** If you add a `routes = [...]` block *after* a `[[kv_namespaces]]` section, TOML parses it as a property of that table, not a top-level key, and wrangler silently ignores it. Put `routes` before any `[[table]]` block, or just use a Custom Domain from the dashboard instead, which creates the DNS record for you and sidesteps the whole issue.
 - **`wrangler` and WSL don't always get along.** If you've got Node/npm installed on the Windows side and you're calling `wrangler` from inside WSL, you can end up with a Windows-compiled `workerd` binary in a Linux environment, which crashes immediately. Simplest fix: install Node and wrangler natively inside WSL, or just run wrangler from PowerShell instead and leave AWS CLI/Terraform/Docker in WSL. Mixing shells across a project is mildly annoying but works fine.
 - **`terraform apply` wants the literal word `yes`, not `y`.** Obvious in hindsight, easy to fumble if you paste a multi-line command and a stray `-var=` flag gets mangled -- Terraform will then interactively prompt for that variable's value instead of showing the plan, and typing "yes" into that prompt does not mean what you think it means. Run the command as one line if your terminal is doing anything weird with line wraps.
-- **A missing or empty `.env` fails differently depending on how it's missing.** No `.env` file at all -- `docker compose up` refuses to start and tells you so, which is fine. But an `.env` that exists with blank `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` (easy to do if you copy `.env.example` and forget to fill it in) starts the container just fine and never sends a single alert, with no error anywhere. Both the DB listener and the Worker now log a loud warning on startup / on first alert attempt if these are missing -- check `docker compose logs` or `wrangler tail` if alerts aren't showing up and everything else looks right.
+- **A missing or empty `.env` fails differently depending on how it's missing.** No `.env` file at all -- `docker compose up` refuses to start and tells you so, which is fine. But an `.env` that exists with blank `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` (easy to do if you copy `.env.example` and forget to fill it in) starts the container just fine and never sends a single alert, with no error anywhere. Both the DB listener and the Worker now log a loud warning on startup / on first alert attempt if these are missing, and the DB listener sends a "LISTENER STARTED" message to Telegram on every start, so a wrong token shows up immediately (and so does a container restart) -- check `docker compose logs` or `wrangler tail` if alerts aren't showing up and everything else looks right.
 
 ## Roadmap
 
 - Fix Azure detection -- either scope the honeytoken a narrow real permission on a decoy resource group so calls reach a resource provider and get logged, or pay for Entra ID P1 and use Sign-in Logs (see the Azure section above for the full story on why the current zero-permission approach doesn't get logged by Activity Log, and why the free alternatives were dead ends)
 - **Known issue, not urgent:** `honeytoken generate` regenerates *all* five decoy types every time it runs, including new random `canary_id`s for ones you might not have touched. If you've already deployed AWS (or Azure) infrastructure pointing at a specific `canary_id` and then re-run `generate` for an unrelated reason (e.g. to pick up a new decoy type after an update), the vault file drifts out of sync with what's actually deployed -- the deployed infrastructure keeps working, but the vault stops being a reliable source of truth for it. Worth adding a `--only` flag to regenerate a single token type without touching the rest.
 - One-command setup that wraps the CLI, `wrangler deploy`, and Terraform behind a single script or container, so this doesn't require five separate tools installed locally -- the current setup assumes a comfort level with CLIs that not every small team has
-- Harden `fake_postgres_listener.py` against real internet-facing scanning, which a test on a public IP showed is not hypothetical (about 300 alerts in a day): per-IP deduplication, labeling what each connection is (HTTP probe, TLS probe, Postgres SSL request, login attempt), and alerting loudly only when a login uses the decoy's own username and database; then async I/O instead of one thread per connection, a Docker healthcheck, and resource limits so a flood of connection attempts can't take down the host
+- *Done in October 2026:* the DB listener now classifies traffic, deduplicates per IP and alerts only on the decoy login, with async I/O, healthcheck and watchdog, resource limits and TLS; the Worker retries delivery, falls back to plain text and survives KV failures.
+- DB listener, next: read the TLS SNI to put the canary ID into DB alerts (the hostname in the DSN already encodes it) and to catch logins made with only the host; a daily summary message so silence can be told apart from a dead listener; generate the TLS certificate on first start instead of at image build (needed before shipping a prebuilt image); keep dedup state across restarts; a local GeoIP database instead of ip-api.com
+- Worker: atomic dedup with a Durable Object; one alert format across Worker and listener (country, ASN and provider fields differ today)
 - More decoy formats -- `.npmrc` / `.piprc` (fake private registry credentials), `kubeconfig` / `docker/config.json` (fake cluster and registry access), and DNS-based canaries (alert when an attacker resolves a hostname that shouldn't exist). To be upfront: Thinkst's Canarytokens already offers kubeconfig and DNS tokens, so the point here is integrating them into this self-hosted pipeline, not claiming a new token type; `.npmrc` appears to be uncovered elsewhere
 - Encrypt `tokens_vault.json` at rest instead of storing it as plaintext JSON
 - IP geolocation via a proper API for more accurate alerts
